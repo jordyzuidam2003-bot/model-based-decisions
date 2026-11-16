@@ -32,6 +32,7 @@ from mesa.datacollection import DataCollector
 import networkx as nx
 import numpy as np
 import random
+import os
 from typing import Iterable, List, Dict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
@@ -44,14 +45,14 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 #
 ####################################
 def choose_strategy_imitate(agent, neighbors):
-    """Choose strategy of the highest-payoff neighbour (including self)."""
+    """Choose strategy of the highest degree-normalised payoff neighbour (including self)."""
     candidates = neighbors + [agent]
     best = max(candidates, key=lambda a: a.payoff)
     return best.strategy
 
 
 def choose_strategy_logit(agent, neighbors, a_I, b, tau):
-    """Choose strategy using logit / softmax choice.
+    """Choose strategy using logit / softmax choice based on degree-normalised expected payoffs.
 
     Parameters
     - agent: the agent choosing a strategy
@@ -60,7 +61,11 @@ def choose_strategy_logit(agent, neighbors, a_I, b, tau):
     - b: defection payoff
     - tau: temperature parameter for softmax
     """
-    # compute expected payoffs for C and D
+    if not neighbors:
+        return agent.strategy
+
+    # compute expected degree-normalised payoffs for C and D
+    k = len(neighbors)
     pi_C = 0.0
     pi_D = 0.0
     for other in neighbors:
@@ -71,6 +76,9 @@ def choose_strategy_logit(agent, neighbors, a_I, b, tau):
         else:
             pi_C += 0.0
             pi_D += b
+
+    pi_C /= k
+    pi_D /= k
 
     # softmax choice
     denom = np.exp(pi_C / tau) + np.exp(pi_D / tau)
@@ -86,7 +94,7 @@ def choose_strategy_logit(agent, neighbors, a_I, b, tau):
 #
 # Attributes
 # - strategy: "C" (adopt EV) or "D" (defect / ICE)
-# - payoff: accumulated payoff from interactions with neighbours
+# - payoff: degree-normalised payoff (average payoff per neighbour) from interactions
 # - next_strategy: strategy chosen for the next time step
 ####################################
 class EVAgent(Agent):
@@ -94,7 +102,7 @@ class EVAgent(Agent):
 
     Attributes
     - strategy: "C" (adopt EV) or "D" (defect / ICE)
-    - payoff: accumulated payoff from interactions with neighbours
+    - payoff: degree-normalised payoff (average payoff per neighbour) from interactions
     - next_strategy: strategy chosen for the next time step
     """
 
@@ -105,13 +113,18 @@ class EVAgent(Agent):
         self.next_strategy = init_strategy
 
     def step(self):
-        """Compute payoff from interactions with neighbours.
+        """Compute degree-normalised payoff from interactions with neighbours.
 
-        Stag Hunt payoff rules:
+        Stag Hunt pairwise payoff rules:
         - C vs C: `a_I` (coordination enhanced by infrastructure)
         - C vs D: 0
         - D vs C: `b`
         - D vs D: `b`
+
+        The round payoff is normalised by the node degree (number of neighbours)
+        to yield the average payoff per interaction:
+        - For strategy D: pi_i(D) = b = 1.0 (constant across all nodes)
+        - For strategy C: pi_i(C) = (k_{i,C} / k_i) * a_I = x_i * a_I
         """
         I = self.model.infrastructure
         a0 = self.model.a0
@@ -138,7 +151,7 @@ class EVAgent(Agent):
                 payoff += b
             else:
                 payoff += b
-        self.payoff = payoff
+        self.payoff = payoff / len(neighbor_agents)
 
     ####################################
     # Advance method
@@ -183,7 +196,7 @@ class EVAgent(Agent):
     # - g_I: infrastructure growth rate
     # - I0: initial infrastructure level
     # - seed: random seed for reproducibility
-    # - network_type: type of network to generate ("random" or "BA")
+    # - network_type: type of network to generate ("random", "BA", or "complete")
     # - n_nodes: number of nodes in the network
     # - p: probability of edge creation in random network
     # - m: number of edges to attach to new node in BA network
@@ -217,6 +230,8 @@ class EVStagHuntModel(Model):
         # Build graph
         if network_type == "BA":
             G = nx.barabasi_albert_graph(n_nodes, m, seed=seed)
+        elif network_type in ["complete", "fully_connected"]:
+            G = nx.complete_graph(n_nodes)
         else:
             G = nx.erdos_renyi_graph(n_nodes, p, seed=seed)
         self.G = G
@@ -598,5 +613,171 @@ def phase_sweep_X0_vs_ratio(
         for i, args in enumerate(tasks):
             row = _row_for_ratio_task(args)
             X_final[i, :] = row
+
+    return X_final
+
+
+# -----------------------------
+# Baseline Simulation & X0 vs I0 Sweep (Assignment Refactored)
+# -----------------------------
+
+def run_simulation_trial(
+    X0_frac: float = 0.1,
+    *,
+    a0: float = 1.0,
+    beta_I: float = 2.5,
+    b: float = 1.0,
+    g_I: float = 0.1,
+    I0: float = 0.1,
+    T: int = 150,
+    network_type: str = "random",
+    n_nodes: int = 200,
+    p: float = 0.03,
+    m: int = 3,
+    seed: int | None = None,
+    init_method: str = "random",
+    high: bool = True,
+    strategy_choice_func: str = "imitate",
+    tau: float = 1.0,
+    policy = None,
+) -> float:
+    """Run a single baseline simulation trial and return final adoption fraction X(T)."""
+    model = EVStagHuntModel(
+        initial_ev=0,
+        a0=a0,
+        beta_I=beta_I,
+        b=b,
+        g_I=g_I,
+        I0=I0,
+        seed=seed,
+        network_type=network_type,
+        n_nodes=n_nodes,
+        p=p,
+        m=m,
+        collect=False,
+        strategy_choice_func=strategy_choice_func,
+        tau=tau,
+    )
+    set_initial_adopters(model, X0_frac, method=init_method, seed=seed, high=high)
+    for step in range(T):
+        if policy is not None:
+            policy(model, step)
+        model.step()
+        if policy is None and strategy_choice_func == "imitate":
+            x = model.get_adoption_fraction()
+            if x == 0.0 or x == 1.0:
+                return x
+    return model.get_adoption_fraction()
+
+
+def _row_for_I0_task(args: Dict) -> np.ndarray:
+    """Worker function to compute one heatmap row for a fixed initial infrastructure I0."""
+    I0 = args["I0"]
+    X0_values = args["X0_values"]
+    a0 = args["a0"]
+    beta_I = args["beta_I"]
+    b = args["b"]
+    g_I = args["g_I"]
+    T = args["T"]
+    network_type = args["network_type"]
+    n_nodes = args["n_nodes"]
+    p = args["p"]
+    m = args["m"]
+    n_seeds = args["n_seeds"]
+    strategy_choice_func = args["strategy_choice_func"]
+    tau = args["tau"]
+    init_method = args.get("init_method", "random")
+
+    row = np.empty(len(X0_values), dtype=float)
+    for j, X0 in enumerate(X0_values):
+        finals: List[float] = []
+        for s in range(n_seeds):
+            seed_s = int(abs(hash((round(float(X0), 4), round(float(I0), 4), s))) % (2**31 - 1))
+            x_star = run_simulation_trial(
+                X0_frac=X0,
+                a0=a0,
+                beta_I=beta_I,
+                b=b,
+                g_I=g_I,
+                I0=I0,
+                T=T,
+                network_type=network_type,
+                n_nodes=n_nodes,
+                p=p,
+                m=m,
+                seed=seed_s,
+                init_method=init_method,
+                strategy_choice_func=strategy_choice_func,
+                tau=tau,
+            )
+            finals.append(x_star)
+        row[j] = float(np.mean(finals))
+    return row
+
+
+def phase_sweep_X0_vs_I0(
+    X0_values: Iterable[float],
+    I0_values: Iterable[float],
+    *,
+    a0: float = 1.0,
+    beta_I: float = 2.5,
+    b: float = 1.0,
+    g_I: float = 0.1,
+    T: int = 150,
+    network_type: str = "random",
+    n_nodes: int = 200,
+    p: float = 0.03,
+    m: int = 3,
+    n_seeds: int = 10,
+    strategy_choice_func: str = "imitate",
+    tau: float = 1.0,
+    init_method: str = "random",
+    max_workers: int | None = None,
+    backend: str = "process",
+) -> np.ndarray:
+    """Compute a 2D matrix of mean final adoption X* over (X0, I0).
+
+    Returns an array of shape (len(I0_values), len(X0_values)).
+    Rows correspond to I0 values (y-axis); columns correspond to X0 values (x-axis).
+    """
+    X0_values = list(X0_values)
+    I0_values = list(I0_values)
+    X_final = np.zeros((len(I0_values), len(X0_values)), dtype=float)
+
+    tasks: List[Dict] = []
+    for I0 in I0_values:
+        tasks.append({
+            "I0": float(I0),
+            "X0_values": X0_values,
+            "a0": a0,
+            "beta_I": beta_I,
+            "b": b,
+            "g_I": g_I,
+            "T": T,
+            "network_type": network_type,
+            "n_nodes": n_nodes,
+            "p": p,
+            "m": m,
+            "n_seeds": n_seeds,
+            "strategy_choice_func": strategy_choice_func,
+            "tau": tau,
+            "init_method": init_method,
+        })
+
+    if max_workers is None:
+        try:
+            max_workers = os.cpu_count() or 1
+        except Exception:
+            max_workers = 1
+
+    Executor = ProcessPoolExecutor if backend == "process" and max_workers > 1 else ThreadPoolExecutor
+    if max_workers > 1:
+        with Executor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_row_for_I0_task, args) for args in tasks]
+            for i, fut in enumerate(futures):
+                X_final[i, :] = fut.result()
+    else:
+        for i, args in enumerate(tasks):
+            X_final[i, :] = _row_for_I0_task(args)
 
     return X_final
